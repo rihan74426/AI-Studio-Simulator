@@ -4,31 +4,249 @@ import {
   Sparkles,
   AlertTriangle,
   X,
-  ChevronLeft,
-  ChevronRight,
   ZoomIn,
+  Upload,
+  Download,
+  Settings,
+  History,
+  Play,
+  Square,
 } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
-import { ErrorBoundary } from "./components/ErrorBoundary";
-import { FileUpload } from "./components/FileUpload";
-import { PromptInput } from "./components/PromptInput";
-import { StyleSelector } from "./components/StyleSelector";
-import { LoadingSpinner } from "./components/LoadingSpinner";
-import { GenerationPreview } from "./components/GenerationPreview";
-import { GenerationHistory } from "./components/GenerationHistory";
-import { GenerationSummary } from "./components/GenerationSummary";
-import { mockApiCall, retryWithBackoff } from "./utils/apiUtils";
-import { saveGeneration, getHistory } from "./utils/storageUtils";
-import type { AppState, Generation, StyleOption, ApiRequest } from "./types";
 
 /**
- * AppEnhanced.tsx
- * - A drop-in enhanced version of your App with improved layout, motion, keyboard interactions,
- *   better history thumbnails, retry progress visualization, accessible zoom modal, and toasts.
- * - Replace your existing `App` export with this component (or import it as a new route).
+ * ProfessionalAIStudioWired.tsx
+ * - Self-contained wiring of UI -> functionality required by the assignment.
+ * - TypeScript; single-file for easy drop-in. Replace your current component with this.
  */
 
-export default function AppEnhanced() {
+/* --------------------------- Types --------------------------- */
+type StyleOption =
+  | "Editorial"
+  | "Portrait"
+  | "Cinematic"
+  | "Artistic"
+  | "Documentary";
+
+type Generation = {
+  id: string;
+  imageUrl: string; // dataURL (base64)
+  prompt: string;
+  style: StyleOption;
+  createdAt: string;
+};
+
+type AppState = {
+  uploadedImage: string | null;
+  prompt: string;
+  style: StyleOption;
+  isLoading: boolean;
+  error: string | null;
+  currentGeneration: Generation | null;
+  abortController: AbortController | null;
+};
+
+/* ------------------------ Constants -------------------------- */
+const HISTORY_KEY = "modelia_history_v1";
+const MAX_HISTORY = 5;
+
+/* ------------------------ Helpers ---------------------------- */
+
+/** downscaleFile: downscale images client-side to maxEdge px and return a JPEG dataURL.
+ * - preserves aspect ratio
+ * - outputs JPEG at quality 0.9 (smaller than PNG)
+ */
+async function downscaleFile(file: File, maxEdge = 1920): Promise<string> {
+  if (!file.type.startsWith("image/")) throw new Error("Not an image file");
+  const imgUrl = URL.createObjectURL(file);
+  try {
+    const img = await new Promise<HTMLImageElement>((res, rej) => {
+      const i = new Image();
+      i.onload = () => res(i);
+      i.onerror = rej;
+      i.src = imgUrl;
+    });
+
+    const { width, height } = img;
+    const longEdge = Math.max(width, height);
+    let targetW = width;
+    let targetH = height;
+    if (longEdge > maxEdge) {
+      const scale = maxEdge / longEdge;
+      targetW = Math.round(width * scale);
+      targetH = Math.round(height * scale);
+    }
+
+    const canvas = document.createElement("canvas");
+    canvas.width = targetW;
+    canvas.height = targetH;
+    const ctx = canvas.getContext("2d")!;
+    ctx.drawImage(img, 0, 0, targetW, targetH);
+    // Use JPEG to shrink size — quality 0.9
+    const dataUrl = canvas.toDataURL("image/jpeg", 0.9);
+    return dataUrl;
+  } finally {
+    URL.revokeObjectURL(imgUrl);
+  }
+}
+
+/** getHistory / saveGeneration using localStorage */
+function getHistory(): Generation[] {
+  try {
+    const raw = localStorage.getItem(HISTORY_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw) as Generation[];
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveGeneration(g: Generation) {
+  const h = getHistory();
+  // dedupe by id (generally not necessary) then prepend and trim
+  const filtered = [g, ...h.filter((x) => x.id !== g.id)].slice(0, MAX_HISTORY);
+  localStorage.setItem(HISTORY_KEY, JSON.stringify(filtered));
+}
+
+/* ------------------------ Mock API --------------------------- */
+
+/**
+ * mockApiCall simulates a remote generation API:
+ * - returns success object after 1-2s
+ * - 20% chance to reject with { message: "Model overloaded" }
+ * - respects AbortSignal (reject with DOMException name 'AbortError')
+ */
+async function mockApiCall(
+  body: { imageDataUrl: string; prompt: string; style: StyleOption },
+  signal?: AbortSignal
+): Promise<{
+  id: string;
+  imageUrl: string;
+  prompt: string;
+  style: StyleOption;
+  createdAt: string;
+}> {
+  // small helper to be cancelable
+  function wait(ms: number) {
+    return new Promise<void>((resolve, reject) => {
+      const t = setTimeout(() => {
+        signal?.removeEventListener("abort", onAbort);
+        resolve();
+      }, ms);
+      const onAbort = () => {
+        clearTimeout(t);
+        reject(new DOMException("Aborted", "AbortError"));
+      };
+      signal?.addEventListener("abort", onAbort);
+      if (signal?.aborted) onAbort();
+    });
+  }
+
+  // variable delay 800-1600ms
+  const delay = 800 + Math.floor(Math.random() * 800);
+  await wait(delay);
+
+  // abort check
+  if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
+
+  // 20% overloaded
+  if (Math.random() < 0.2) {
+    const err: any = new Error("Model overloaded");
+    err.message = "Model overloaded";
+    throw err;
+  }
+
+  // success: we simulate a generated image by blending the input with a gradient overlay
+  const now = Date.now();
+  const generatedDataUrl = body.imageDataUrl.startsWith("data:")
+    ? // if the input is data URL we can overlay text by just returning a generated SVG with prompt (keeps it simple)
+      `data:image/svg+xml,${encodeURIComponent(`<svg xmlns='http://www.w3.org/2000/svg' width='1200' height='800'>
+        <defs><linearGradient id='g' x1='0' x2='1'><stop offset='0' stop-color='#6366f1'/><stop offset='1' stop-color='#ec4899'/></linearGradient></defs>
+        <rect width='100%' height='100%' fill='url(#g)'/>
+        <text x='50%' y='45%' font-size='36' text-anchor='middle' fill='white' font-family='Arial'>${escapeXml(
+          body.style
+        )}</text>
+        <text x='50%' y='60%' font-size='18' text-anchor='middle' fill='rgba(255,255,255,0.9)'>${escapeXml(
+          truncate(body.prompt, 80)
+        )}</text>
+      </svg>`)}`
+    : body.imageDataUrl;
+
+  return {
+    id: now.toString(),
+    imageUrl: generatedDataUrl,
+    prompt: body.prompt,
+    style: body.style,
+    createdAt: new Date(now).toISOString(),
+  };
+}
+
+/* ---------------------- Retry helper ------------------------- */
+/**
+ * retryWithBackoff(fn, attempts, baseDelay, jitter)
+ * - retries only when the thrown error's message === "Model overloaded"
+ * - respects AbortSignal if provided inside fn (fn should accept the signal)
+ */
+async function retryWithBackoff<T>(
+  fn: () => Promise<T>,
+  attempts = 3,
+  baseDelay = 500,
+  jitter = 100,
+  signal?: AbortSignal
+): Promise<T> {
+  let attempt = 0;
+  while (attempt < attempts) {
+    attempt++;
+    try {
+      return await fn();
+    } catch (err: any) {
+      if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
+      const msg = (err && err.message) || String(err || "");
+      // only retry on overloaded
+      if (msg === "Model overloaded" && attempt < attempts) {
+        const delay =
+          baseDelay * Math.pow(2, attempt - 1) +
+          Math.floor(Math.random() * jitter);
+        await new Promise<void>((res, rej) => {
+          const t = setTimeout(() => {
+            signal?.removeEventListener("abort", onAbort);
+            res();
+          }, delay);
+          const onAbort = () => {
+            clearTimeout(t);
+            rej(new DOMException("Aborted", "AbortError"));
+          };
+          signal?.addEventListener("abort", onAbort);
+          if (signal?.aborted) onAbort();
+        });
+        continue;
+      }
+      // don't retry other errors
+      throw err;
+    }
+  }
+  // If we exhausted attempts, throw final error
+  throw new Error("Failed after retries");
+}
+
+/* ------------------------ Utils ------------------------------ */
+function truncate(s: string, n = 80) {
+  return s.length > n ? s.slice(0, n - 1) + "…" : s;
+}
+function escapeXml(s: string) {
+  return s.replace(
+    /[&<>"']/g,
+    (c) =>
+      ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&apos;" }[
+        c
+      ] as string)
+  );
+}
+
+/* ------------------------ Component -------------------------- */
+
+export default function ProfessionalAIStudioWired(): JSX.Element {
   const [state, setState] = useState<AppState>({
     uploadedImage: null,
     prompt: "",
@@ -39,7 +257,7 @@ export default function AppEnhanced() {
     abortController: null,
   });
 
-  const [history, setHistory] = useState<Generation[]>([]);
+  const [history, setHistoryState] = useState<Generation[]>(() => getHistory());
   const [retryAttempt, setRetryAttempt] = useState(0);
   const [toast, setToast] = useState<{
     id: number;
@@ -47,13 +265,13 @@ export default function AppEnhanced() {
     text: string;
   } | null>(null);
   const [zoomImage, setZoomImage] = useState<string | null>(null);
+  const [showHistory, setShowHistory] = useState(false);
 
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
   const mounted = useRef(true);
-  const toastId = useRef(1);
 
   useEffect(() => {
-    // single mount load
-    setHistory(getHistory());
+    mounted.current = true;
     return () => {
       mounted.current = false;
     };
@@ -63,69 +281,48 @@ export default function AppEnhanced() {
     setState((prev) => ({ ...prev, ...updates }));
   }, []);
 
-  // Toast helper
   const pushToast = useCallback(
-    (type: "info" | "error" | "success", text: string, ttl = 3500) => {
-      const id = toastId.current++;
+    (type: "info" | "error" | "success", text: string) => {
+      const id = Date.now();
       setToast({ id, type, text });
       setTimeout(() => {
-        // remove only if it's the same toast (avoid removing newer one)
-        setToast((t) => (t && t.id === id ? null : t));
-      }, ttl);
+        if (mounted.current) setToast((t) => (t && t.id === id ? null : t));
+      }, 3000);
     },
     []
   );
 
-  // Image handlers
-  const handleImageUpload = useCallback(
-    (dataUrl: string) => {
-      updateState({ uploadedImage: dataUrl, error: null });
+  /* ---------- file handling: open file input and process --------- */
+  const openFilePicker = useCallback(() => fileInputRef.current?.click(), []);
+  const onFileSelected = useCallback(
+    async (file?: File) => {
+      if (!file) return;
+      try {
+        // downscale if needed
+        const dataUrl = await downscaleFile(file, 1920);
+        updateState({ uploadedImage: dataUrl, error: null });
+        pushToast("success", "Image ready");
+      } catch (err: any) {
+        pushToast("error", err?.message || "Failed to process image");
+      }
     },
-    [updateState]
+    [updateState, pushToast]
   );
 
-  const handleRemoveImage = useCallback(() => {
-    updateState({ uploadedImage: null });
-  }, [updateState]);
-
-  // prompt/style
-  const handlePromptChange = useCallback(
-    (prompt: string) => updateState({ prompt }),
-    [updateState]
-  );
-  const handleStyleChange = useCallback(
-    (style: StyleOption) => updateState({ style }),
-    [updateState]
-  );
-
-  // Abort
-  const handleAbort = useCallback(() => {
-    if (state.abortController) {
-      state.abortController.abort();
-      updateState({
-        isLoading: false,
-        abortController: null,
-        error: "Generation cancelled by user",
-      });
-      pushToast("info", "Generation aborted");
-      setRetryAttempt(0);
-    }
-  }, [state.abortController, updateState, pushToast]);
-
-  // Generate with better UX: show live preview while waiting, progress bar for retries, keyboard shortcut
+  /* ---------- generate flow with retries & abort support --------- */
   const handleGenerate = useCallback(async () => {
     if (!state.uploadedImage || !state.prompt.trim() || state.isLoading) return;
 
-    const abortController = new AbortController();
+    const controller = new AbortController();
     updateState({
       isLoading: true,
       error: null,
       currentGeneration: null,
-      abortController,
+      abortController: controller,
     });
     setRetryAttempt(0);
 
-    const request: ApiRequest = {
+    const body = {
       imageDataUrl: state.uploadedImage,
       prompt: state.prompt.trim(),
       style: state.style,
@@ -134,19 +331,17 @@ export default function AppEnhanced() {
     try {
       const result = await retryWithBackoff(
         () => {
-          setRetryAttempt((prev) => prev + 1);
-          return mockApiCall(request, abortController.signal);
+          // track attempts
+          setRetryAttempt((a) => a + 1);
+          return mockApiCall(body, controller.signal);
         },
         3,
         500,
-        100,
-        (attempt) => {
-          // live progress callback (optional hook from utils)
-          // we keep this simple by updating retryAttempt via setRetryAttempt above
-        }
+        120,
+        controller.signal
       );
 
-      if (!mounted.current || abortController.signal.aborted) return;
+      if (!mounted.current || controller.signal.aborted) return;
 
       const generation: Generation = {
         id: result.id,
@@ -156,9 +351,9 @@ export default function AppEnhanced() {
         createdAt: result.createdAt,
       };
 
+      // persist & update UI
       saveGeneration(generation);
-      setHistory(getHistory());
-
+      setHistoryState(getHistory());
       updateState({
         currentGeneration: generation,
         isLoading: false,
@@ -167,16 +362,22 @@ export default function AppEnhanced() {
       });
       pushToast("success", "Generation saved to history");
       setRetryAttempt(0);
-    } catch (error: any) {
-      if (!mounted.current || abortController.signal.aborted) return;
-      const errorMessage =
-        error instanceof Error ? error.message : "Generation failed";
-      updateState({
-        isLoading: false,
-        abortController: null,
-        error: errorMessage,
-      });
-      pushToast("error", errorMessage);
+    } catch (err: any) {
+      if (!mounted.current) return;
+      if (err && err.name === "AbortError") {
+        // aborted by user
+        updateState({
+          isLoading: false,
+          abortController: null,
+          error: "Generation aborted",
+        });
+        pushToast("info", "Generation aborted");
+        setRetryAttempt(0);
+        return;
+      }
+      const message = (err && err.message) || "Generation failed";
+      updateState({ isLoading: false, abortController: null, error: message });
+      pushToast("error", message);
       setRetryAttempt(0);
     }
   }, [
@@ -188,13 +389,25 @@ export default function AppEnhanced() {
     pushToast,
   ]);
 
-  // Restore generation from history
-  const handleSelectGeneration = useCallback(
-    (generation: Generation) => {
+  const handleAbort = useCallback(() => {
+    if (state.abortController) {
+      state.abortController.abort();
       updateState({
-        currentGeneration: generation,
-        prompt: generation.prompt,
-        style: generation.style as StyleOption,
+        isLoading: false,
+        abortController: null,
+        error: "Generation cancelled",
+      });
+      pushToast("info", "Generation cancelled");
+      setRetryAttempt(0);
+    }
+  }, [state.abortController, updateState, pushToast]);
+
+  const handleHistoryClick = useCallback(
+    (g: Generation) => {
+      updateState({
+        currentGeneration: g,
+        prompt: g.prompt,
+        style: g.style,
         error: null,
       });
       pushToast("info", "Restored from history");
@@ -202,421 +415,498 @@ export default function AppEnhanced() {
     [updateState, pushToast]
   );
 
-  const handleHistoryUpdate = useCallback(() => setHistory(getHistory()), []);
-
-  // Keyboard: Enter to generate when focus is inside prompt; Esc to close zoom modal
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") setZoomImage(null);
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, []);
-
   const canGenerate =
     !!state.uploadedImage && !!state.prompt.trim() && !state.isLoading;
 
+  /* -------------------- small accessibility helpers -------------------- */
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      // Ctrl/Cmd + Enter to generate
+      if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
+        e.preventDefault();
+        handleGenerate();
+      }
+      if (e.key === "Escape") {
+        // close zoom or history
+        if (zoomImage) setZoomImage(null);
+        else if (showHistory) setShowHistory(false);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [handleGenerate, zoomImage, showHistory]);
+
+  /* ------------------------ JSX UI ------------------------ */
   return (
-    <ErrorBoundary>
-      <div className="min-h-screen bg-gradient-to-b from-gray-950 via-gray-900 to-gray-950 text-white">
-        {/* Header */}
-        <header className="sticky top-0 z-30 backdrop-blur bg-opacity-30 bg-gray-900/60 border-b border-gray-800">
-          <div className="max-w-7xl mx-auto px-4 py-4 flex items-center justify-between gap-4">
+    <div className="min-h-screen bg-gradient-to-br from-slate-900 via-slate-800 to-slate-900 text-white">
+      {/* Hidden file input */}
+      <input
+        ref={fileInputRef}
+        type="file"
+        accept="image/*"
+        className="hidden"
+        onChange={(e) => {
+          const f = e.target.files?.[0];
+          e.currentTarget.value = "";
+          if (f) onFileSelected(f);
+        }}
+      />
+
+      {/* Top Navigation */}
+      <nav className="border-b border-slate-700 bg-slate-900/50 backdrop-blur-sm">
+        <div className="max-w-7xl mx-auto px-6 py-4">
+          <div className="flex items-center justify-between">
             <div className="flex items-center gap-3">
-              <div className="p-2 bg-gradient-to-r from-purple-600 to-blue-500 rounded-lg shadow">
-                <Wand2 className="h-6 w-6 text-white" />
+              <div className="p-2 bg-gradient-to-r from-indigo-500 to-purple-600 rounded-lg">
+                <Wand2 className="w-6 h-6" />
               </div>
               <div>
-                <h1 className="text-2xl font-extrabold">
-                  AI Studio — Enhanced
-                </h1>
-                <p className="text-sm text-gray-400">
-                  Interactive preview, animated history, and accessible controls
+                <h1 className="text-xl font-bold">AI Studio Pro</h1>
+                <p className="text-xs text-slate-400">
+                  Advanced Image Generation
                 </p>
               </div>
             </div>
-
             <div className="flex items-center gap-3">
-              <div className="hidden sm:flex items-center gap-2 text-sm text-gray-300">
-                <Sparkles className="h-4 w-4" />
-                <span>
-                  Press{" "}
-                  <kbd className="px-2 py-0.5 rounded bg-gray-800">Esc</kbd> to
-                  close images
-                </span>
-              </div>
+              <button
+                onClick={() => setShowHistory((s) => !s)}
+                className="p-2 hover:bg-slate-800 rounded-lg transition-colors"
+                aria-pressed={showHistory}
+                aria-label="Toggle history panel"
+              >
+                <History className="w-5 h-5" />
+              </button>
+              <button
+                className="p-2 hover:bg-slate-800 rounded-lg transition-colors"
+                aria-label="Settings"
+              >
+                <Settings className="w-5 h-5" />
+              </button>
             </div>
           </div>
-        </header>
+        </div>
+      </nav>
 
-        {/* Main */}
-        <main className="max-w-7xl mx-auto px-4 py-8">
-          <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
-            {/* Left controls */}
-            <aside className="lg:col-span-4 space-y-6">
-              <div className="bg-gray-800 rounded-2xl p-5 border border-gray-700 shadow-sm">
-                <h2 className="text-lg font-semibold mb-3">
-                  Upload • Prompt • Style
-                </h2>
-                <FileUpload
-                  onImageUpload={handleImageUpload}
-                  uploadedImage={state.uploadedImage}
-                  onRemoveImage={handleRemoveImage}
-                  disabled={state.isLoading}
-                />
+      <div className="flex h-[calc(100vh-73px)]">
+        {/* Left Sidebar - Controls */}
+        <div className="w-80 border-r border-slate-700 bg-slate-900/30 p-6 overflow-y-auto">
+          <div className="space-y-6">
+            {/* Image Upload */}
+            <div>
+              <h3 className="text-sm font-semibold text-slate-300 mb-3">
+                Source Image
+              </h3>
 
-                <div className="mt-4">
-                  <PromptInput
-                    value={state.prompt}
-                    onChange={handlePromptChange}
-                    disabled={state.isLoading}
-                    placeholder="e.g. A cozy portrait in warm editorial tones"
-                  />
-                </div>
-
-                <div className="mt-4">
-                  <StyleSelector
-                    value={state.style}
-                    onChange={handleStyleChange}
-                    disabled={state.isLoading}
-                  />
-                </div>
-
-                <GenerationSummary
-                  hasImage={!!state.uploadedImage}
-                  prompt={state.prompt}
-                  style={state.style}
-                />
-
-                <div className="mt-4 flex items-center gap-3">
-                  <button
-                    onClick={handleGenerate}
-                    disabled={!canGenerate}
-                    className="flex-1 inline-flex items-center justify-center gap-2 py-3 px-4 rounded-lg font-semibold bg-gradient-to-r from-purple-600 to-blue-600 hover:scale-[1.02] focus:outline-none focus-visible:ring-4 focus-visible:ring-purple-600/40 disabled:opacity-50 disabled:cursor-not-allowed"
-                    aria-disabled={!canGenerate}
-                    aria-live="polite"
-                  >
-                    <Sparkles className="h-5 w-5" />
-                    <span>{state.isLoading ? "Generating…" : "Generate"}</span>
-                  </button>
-
-                  <button
-                    onClick={handleAbort}
-                    disabled={!state.isLoading}
-                    className="w-12 h-12 rounded-lg bg-gray-800 border border-gray-700 flex items-center justify-center focus:outline-none focus-visible:ring-2 focus-visible:ring-red-500/50"
-                    aria-label="Abort generation"
-                  >
-                    <X className="h-5 w-5 text-red-400" />
-                  </button>
-                </div>
-
-                {/* Retry progress */}
-                <div className="mt-3">
-                  <AnimatePresence>
-                    {state.isLoading && (
-                      <motion.div
-                        initial={{ opacity: 0 }}
-                        animate={{ opacity: 1 }}
-                        exit={{ opacity: 0 }}
-                        className="space-y-1"
-                      >
-                        <div className="text-xs text-gray-300">
-                          Attempt {retryAttempt} of 3
-                        </div>
-                        <div className="w-full h-2 bg-gray-700 rounded overflow-hidden">
-                          <motion.div
-                            key={retryAttempt}
-                            initial={{ width: 0 }}
-                            animate={{
-                              width: `${Math.min(
-                                100,
-                                (retryAttempt / 3) * 100
-                              )}%`,
-                            }}
-                            transition={{ duration: 0.4 }}
-                            className="h-full bg-gradient-to-r from-purple-500 to-blue-500"
-                          />
-                        </div>
-                      </motion.div>
-                    )}
-                  </AnimatePresence>
-                </div>
-
-                {/* small hint */}
-                <p className="mt-4 text-xs text-gray-400">
-                  Tip: Use descriptive prompts and try different styles. Your
-                  last 5 results are saved in history on the right.
-                </p>
-              </div>
-            </aside>
-
-            {/* Center preview */}
-            <section className="lg:col-span-4">
-              <div className="bg-gray-800 rounded-2xl p-6 border border-gray-700 shadow-sm h-full flex flex-col gap-4">
-                <div className="flex items-start justify-between">
-                  <h2 className="text-lg font-semibold">Preview</h2>
-
-                  <div className="flex items-center gap-2 text-sm text-gray-300">
-                    {state.currentGeneration ? (
-                      <span className="inline-flex items-center gap-2">
-                        Generated{" "}
-                        <span className="text-gray-400">
-                          {new Date(
-                            state.currentGeneration.createdAt
-                          ).toLocaleString()}
-                        </span>
-                      </span>
-                    ) : (
-                      <span className="inline-flex items-center gap-2">
-                        Live preview
-                      </span>
-                    )}
-                  </div>
-                </div>
-
-                <div className="flex-1 grid grid-cols-1 gap-4">
-                  <div className="rounded-xl overflow-hidden border border-dashed border-gray-700 bg-gradient-to-b from-gray-800/20 to-gray-800/10 aspect-video flex items-center justify-center">
-                    <AnimatePresence>
-                      {state.isLoading ? (
-                        <motion.div
-                          key="spinner"
-                          initial={{ opacity: 0 }}
-                          animate={{ opacity: 1 }}
-                          exit={{ opacity: 0 }}
-                          className="flex items-center justify-center w-full h-full"
-                        >
-                          <LoadingSpinner
-                            onAbort={handleAbort}
-                            currentAttempt={retryAttempt}
-                            maxAttempts={3}
-                          />
-                        </motion.div>
-                      ) : state.currentGeneration ? (
-                        <motion.div
-                          key="gen"
-                          initial={{ opacity: 0, scale: 0.98 }}
-                          animate={{ opacity: 1, scale: 1 }}
-                          exit={{ opacity: 0 }}
-                          className="w-full h-full flex items-center justify-center p-4"
-                        >
-                          <div className="relative w-full h-full">
-                            <img
-                              src={state.currentGeneration.imageUrl}
-                              alt={state.currentGeneration.prompt}
-                              className="object-contain w-full h-full rounded-lg cursor-zoom-in"
-                              onClick={() =>
-                                setZoomImage(state.currentGeneration!.imageUrl)
-                              }
-                              role="button"
-                              tabIndex={0}
-                              onKeyDown={(e) => {
-                                if (e.key === "Enter")
-                                  setZoomImage(
-                                    state.currentGeneration!.imageUrl
-                                  );
-                              }}
-                            />
-
-                            <div className="absolute left-3 bottom-3 bg-black/40 px-3 py-1 rounded-md text-xs backdrop-blur text-gray-100">
-                              {state.currentGeneration.style} —{" "}
-                              {state.currentGeneration.prompt.slice(0, 60)}
-                              {state.currentGeneration.prompt.length > 60
-                                ? "…"
-                                : ""}
-                            </div>
-                          </div>
-                        </motion.div>
-                      ) : state.uploadedImage ? (
-                        <motion.div
-                          key="uploaded"
-                          initial={{ opacity: 0 }}
-                          animate={{ opacity: 1 }}
-                          exit={{ opacity: 0 }}
-                          className="w-full h-full p-4 flex items-center justify-center"
-                        >
-                          <div className="relative w-full h-full">
-                            <img
-                              src={state.uploadedImage}
-                              alt={state.prompt || "Uploaded image"}
-                              className="object-contain w-full h-full rounded-lg cursor-zoom-in"
-                              onClick={() => setZoomImage(state.uploadedImage)}
-                            />
-                          </div>
-                        </motion.div>
-                      ) : (
-                        <motion.div
-                          key="empty"
-                          initial={{ opacity: 0 }}
-                          animate={{ opacity: 1 }}
-                          exit={{ opacity: 0 }}
-                          className="h-full w-full flex flex-col items-center justify-center text-center text-gray-400 p-4"
-                        >
-                          <Wand2 className="h-14 w-14 text-gray-500 mb-2" />
-                          <p className="font-medium">No image yet</p>
-                          <p className="text-sm mt-1">
-                            Upload an image and write a prompt to see a live
-                            preview and generate.
-                          </p>
-                        </motion.div>
-                      )}
-                    </AnimatePresence>
-                  </div>
-
-                  {/* small meta / actions */}
-                  <div className="flex items-center justify-between gap-3">
-                    <div className="text-xs text-gray-400">
-                      Prompt:{" "}
-                      <span className="text-gray-200">
-                        {state.prompt || "—"}
-                      </span>
-                    </div>
-                    <div className="flex items-center gap-2">
+              {/* Inline uploader that uses the real file picker */}
+              <div className="relative">
+                {state.uploadedImage ? (
+                  <div className="relative group">
+                    <img
+                      src={state.uploadedImage}
+                      alt="Uploaded"
+                      className="w-full h-32 object-cover rounded-lg border border-slate-700"
+                    />
+                    <div className="absolute top-2 right-2 flex gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
                       <button
-                        className="text-xs px-2 py-1 rounded bg-gray-800 border border-gray-700 focus-visible:ring-2 focus-visible:ring-indigo-500"
-                        onClick={() => {
-                          if (state.currentGeneration)
-                            setZoomImage(state.currentGeneration.imageUrl);
-                        }}
-                        aria-label="Open large preview"
+                        onClick={() => openFilePicker()}
+                        className="bg-slate-800/80 p-1 rounded text-slate-200"
+                        aria-label="Replace image"
                       >
-                        <ZoomIn className="h-4 w-4 inline mr-1" /> View large
+                        <Upload className="w-4 h-4" />
+                      </button>
+                      <button
+                        onClick={() => updateState({ uploadedImage: null })}
+                        className="bg-red-600 p-1 rounded text-white"
+                        aria-label="Remove image"
+                      >
+                        <X className="w-4 h-4" />
                       </button>
                     </div>
                   </div>
-                </div>
-              </div>
-            </section>
-
-            {/* Right history */}
-            <aside className="lg:col-span-4">
-              <div className="bg-gray-800 rounded-2xl p-5 border border-gray-700 shadow-sm h-full flex flex-col gap-4">
-                <div className="flex items-center justify-between">
-                  <h2 className="text-lg font-semibold">History (last 5)</h2>
-                  <div className="text-sm text-gray-400">
-                    Click / keyboard-select to restore
+                ) : (
+                  <div
+                    role="button"
+                    tabIndex={0}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") openFilePicker();
+                    }}
+                    onClick={() => openFilePicker()}
+                    className="border-2 border-dashed border-slate-600 rounded-lg p-6 text-center hover:border-slate-500 transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500"
+                    aria-label="Upload image"
+                  >
+                    <Upload className="w-8 h-8 mx-auto mb-2 text-slate-400" />
+                    <p className="text-sm text-slate-400">
+                      Click to upload image (will downscale if 1920px)
+                    </p>
                   </div>
-                </div>
-
-                <div className="flex-1 overflow-auto">
-                  <div className="grid grid-cols-2 gap-3">
-                    {history.length === 0 ? (
-                      <div className="col-span-2 text-sm text-gray-400">
-                        No history yet. Your successful generations will appear
-                        here.
-                      </div>
-                    ) : (
-                      history.map((g, idx) => (
-                        <motion.button
-                          key={g.id}
-                          onClick={() => handleSelectGeneration(g)}
-                          onDoubleClick={() => setZoomImage(g.imageUrl)}
-                          whileHover={{ scale: 1.02 }}
-                          whileTap={{ scale: 0.98 }}
-                          className="group relative rounded-lg overflow-hidden border border-gray-700 p-0 focus:outline-none focus-visible:ring-2 focus-visible:ring-purple-600"
-                          aria-label={`Restore generation ${g.prompt}`}
-                        >
-                          <img
-                            src={g.imageUrl}
-                            alt={g.prompt}
-                            className="w-full h-28 object-cover"
-                          />
-
-                          <div className="absolute inset-0 bg-black/0 group-hover:bg-black/30 transition-colors flex items-end">
-                            <div className="p-2 w-full text-xs text-white bg-gradient-to-t from-black/60 to-transparent">
-                              <div className="font-medium truncate">
-                                {g.prompt}
-                              </div>
-                              <div className="text-[11px] text-gray-300 truncate">
-                                {g.style} •{" "}
-                                {new Date(g.createdAt).toLocaleString()}
-                              </div>
-                            </div>
-                          </div>
-                        </motion.button>
-                      ))
-                    )}
-                  </div>
-                </div>
-
-                <div className="text-xs text-gray-400">
-                  History is stored in localStorage and kept for your last 5
-                  generations.
-                </div>
+                )}
               </div>
-            </aside>
+            </div>
+
+            {/* Prompt Input */}
+            <div>
+              <h3 className="text-sm font-semibold text-slate-300 mb-3">
+                Prompt
+              </h3>
+              <textarea
+                value={state.prompt}
+                onChange={(e) => updateState({ prompt: e.target.value })}
+                placeholder="Describe the style and transformation you want..."
+                className="w-full h-32 px-3 py-2 bg-slate-800 border border-slate-700 rounded-lg resize-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent text-sm"
+                disabled={state.isLoading}
+              />
+              <p className="text-xs text-slate-400 mt-2">
+                {state.prompt.length}/500 characters
+              </p>
+            </div>
+
+            {/* Style Selector */}
+            <div>
+              <h3 className="text-sm font-semibold text-slate-300 mb-3">
+                Style
+              </h3>
+              <div className="grid grid-cols-2 gap-2">
+                {(
+                  [
+                    "Editorial",
+                    "Portrait",
+                    "Cinematic",
+                    "Artistic",
+                    "Documentary",
+                  ] as StyleOption[]
+                ).map((s) => (
+                  <button
+                    key={s}
+                    onClick={() => updateState({ style: s })}
+                    className={`p-3 rounded-lg text-sm font-medium transition-all ${
+                      state.style === s
+                        ? "bg-indigo-600 text-white shadow-lg"
+                        : "bg-slate-800 text-slate-300 hover:bg-slate-700"
+                    }`}
+                    disabled={state.isLoading}
+                    aria-pressed={state.style === s}
+                  >
+                    {s}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {/* Generate Button */}
+            <div className="pt-4">
+              <button
+                onClick={handleGenerate}
+                disabled={!canGenerate}
+                className={`w-full py-4 rounded-lg font-semibold text-sm transition-all flex items-center justify-center gap-2 ${
+                  canGenerate && !state.isLoading
+                    ? "bg-gradient-to-r from-indigo-600 to-purple-600 hover:from-indigo-700 hover:to-purple-700 text-white shadow-lg"
+                    : "bg-slate-700 text-slate-400 cursor-not-allowed"
+                }`}
+                aria-disabled={!canGenerate}
+              >
+                {state.isLoading ? (
+                  <>
+                    <Square className="w-4 h-4" /> Generating...
+                  </>
+                ) : (
+                  <>
+                    <Play className="w-4 h-4" /> Generate Image
+                  </>
+                )}
+              </button>
+
+              {state.isLoading && (
+                <div className="mt-3">
+                  <div className="flex items-center justify-between text-xs text-slate-400 mb-1">
+                    <span>Progress</span>
+                    <span>Attempt {retryAttempt} of 3</span>
+                  </div>
+                  <div className="w-full h-2 bg-slate-800 rounded-full overflow-hidden">
+                    <motion.div
+                      initial={{ width: 0 }}
+                      animate={{ width: `${(retryAttempt / 3) * 100}%` }}
+                      className="h-full bg-gradient-to-r from-indigo-500 to-purple-500"
+                    />
+                  </div>
+                  <button
+                    onClick={handleAbort}
+                    className="w-full mt-2 py-2 bg-red-600 hover:bg-red-700 rounded text-xs font-medium"
+                  >
+                    Cancel Generation
+                  </button>
+                </div>
+              )}
+            </div>
           </div>
-        </main>
+        </div>
 
-        {/* Zoom Modal */}
+        {/* Main Preview Area */}
+        <div className="flex-1 flex flex-col">
+          {/* Preview Header */}
+          <div className="border-b border-slate-700 bg-slate-900/20 px-6 py-4">
+            <div className="flex items-center justify-between">
+              <div>
+                <h2 className="text-lg font-semibold">Preview</h2>
+                <p className="text-sm text-slate-400">
+                  {state.currentGeneration
+                    ? `Generated ${new Date(
+                        state.currentGeneration.createdAt
+                      ).toLocaleTimeString()}`
+                    : state.uploadedImage
+                    ? "Source image loaded"
+                    : "Upload an image to begin"}
+                </p>
+              </div>
+              <div className="flex items-center gap-2">
+                {state.currentGeneration && (
+                  <>
+                    <button
+                      onClick={() =>
+                        setZoomImage(state.currentGeneration!.imageUrl)
+                      }
+                      className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 rounded text-sm flex items-center gap-1"
+                    >
+                      <ZoomIn className="w-4 h-4" /> Full Size
+                    </button>
+                    <button
+                      onClick={() => {
+                        /* implement download logic if desired */
+                      }}
+                      className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 rounded text-sm flex items-center gap-1"
+                    >
+                      <Download className="w-4 h-4" />
+                      Download
+                    </button>
+                  </>
+                )}
+              </div>
+            </div>
+          </div>
+
+          {/* Preview Content */}
+          <div className="flex-1 flex items-center justify-center p-8 bg-slate-900/10">
+            <div className="w-full h-full max-w-4xl max-h-[70vh] flex items-center justify-center">
+              <AnimatePresence mode="wait">
+                {state.isLoading ? (
+                  <motion.div
+                    key="loading"
+                    initial={{ opacity: 0 }}
+                    animate={{ opacity: 1 }}
+                    exit={{ opacity: 0 }}
+                  >
+                    <div className="flex flex-col items-center gap-4">
+                      <div className="relative">
+                        <div className="w-16 h-16 border-4 border-slate-700 border-t-indigo-500 rounded-full animate-spin" />
+                        <div className="absolute inset-0 flex items-center justify-center">
+                          <span className="text-xs font-mono">
+                            {retryAttempt}/3
+                          </span>
+                        </div>
+                      </div>
+                      <div className="text-center text-slate-300">
+                        Generating your image...
+                      </div>
+                    </div>
+                  </motion.div>
+                ) : state.currentGeneration ? (
+                  <motion.div
+                    key="generated"
+                    initial={{ opacity: 0, scale: 0.9 }}
+                    animate={{ opacity: 1, scale: 1 }}
+                    exit={{ opacity: 0 }}
+                    className="relative group w-full h-full flex items-center justify-center"
+                  >
+                    <img
+                      src={state.currentGeneration.imageUrl}
+                      alt={state.currentGeneration.prompt}
+                      className="max-w-full max-h-full object-contain rounded-xl shadow-2xl cursor-zoom-in"
+                      onClick={() =>
+                        setZoomImage(state.currentGeneration!.imageUrl)
+                      }
+                    />
+                    <div className="absolute bottom-4 left-4 right-4 bg-black/60 backdrop-blur-sm rounded-lg p-3 opacity-0 group-hover:opacity-100 transition-opacity">
+                      <p className="text-sm font-medium">
+                        {state.currentGeneration.prompt}
+                      </p>
+                      <p className="text-xs text-slate-300 mt-1">
+                        Style: {state.currentGeneration.style}
+                      </p>
+                    </div>
+                  </motion.div>
+                ) : state.uploadedImage ? (
+                  <motion.div
+                    key="uploaded"
+                    initial={{ opacity: 0 }}
+                    animate={{ opacity: 1 }}
+                    exit={{ opacity: 0 }}
+                    className="w-full h-full flex items-center justify-center"
+                  >
+                    <img
+                      src={state.uploadedImage}
+                      alt="Uploaded source"
+                      className="max-w-full max-h-full object-contain rounded-xl shadow-lg"
+                    />
+                  </motion.div>
+                ) : (
+                  <motion.div
+                    key="empty"
+                    initial={{ opacity: 0 }}
+                    animate={{ opacity: 1 }}
+                    exit={{ opacity: 0 }}
+                    className="text-center text-slate-400"
+                  >
+                    <div className="w-24 h-24 mx-auto mb-6 rounded-full bg-slate-800 flex items-center justify-center">
+                      <Wand2 className="w-12 h-12" />
+                    </div>
+                    <h3 className="text-xl font-semibold mb-2">
+                      Ready to Create
+                    </h3>
+                    <p className="text-slate-500 max-w-md">
+                      Upload an image and describe your vision. Our AI will
+                      transform it according to your prompt.
+                    </p>
+                  </motion.div>
+                )}
+              </AnimatePresence>
+            </div>
+          </div>
+        </div>
+
+        {/* Right Sidebar - History */}
         <AnimatePresence>
-          {zoomImage && (
+          {showHistory && (
             <motion.div
-              initial={{ opacity: 0 }}
-              animate={{ opacity: 1 }}
-              exit={{ opacity: 0 }}
-              className="fixed inset-0 z-50 flex items-center justify-center p-4"
+              initial={{ width: 0, opacity: 0 }}
+              animate={{ width: 320, opacity: 1 }}
+              exit={{ width: 0, opacity: 0 }}
+              className="border-l border-slate-700 bg-slate-900/30 overflow-hidden"
+              aria-hidden={!showHistory}
             >
               <div
-                className="absolute inset-0 bg-black/70"
-                onClick={() => setZoomImage(null)}
-                aria-hidden
-              />
-
-              <motion.div
-                initial={{ scale: 0.98 }}
-                animate={{ scale: 1 }}
-                exit={{ scale: 0.98 }}
-                className="relative max-w-4xl w-full bg-gray-900 rounded-lg overflow-hidden"
+                className="p-6 h-full overflow-y-auto"
+                role="region"
+                aria-label="Generation history"
               >
-                <button
-                  className="absolute right-3 top-3 bg-gray-800/60 p-2 rounded focus:outline-none"
-                  onClick={() => setZoomImage(null)}
-                  aria-label="Close"
-                >
-                  <X className="h-5 w-5" />
-                </button>
-                <div className="p-4">
-                  <img
-                    src={zoomImage}
-                    alt="Zoomed"
-                    className="w-full h-[60vh] object-contain"
-                  />
+                <div className="flex items-center justify-between mb-4">
+                  <h3 className="font-semibold">Generation History</h3>
+                  <button
+                    onClick={() => setShowHistory(false)}
+                    className="p-1 hover:bg-slate-800 rounded"
+                    aria-label="Close history"
+                  >
+                    <X className="w-4 h-4" />
+                  </button>
                 </div>
-              </motion.div>
+
+                <div className="space-y-3">
+                  {history.length === 0 ? (
+                    <p className="text-sm text-slate-400 text-center py-8">
+                      Your generated images will appear here
+                    </p>
+                  ) : (
+                    history.map((generation) => (
+                      <motion.div
+                        key={generation.id}
+                        initial={{ opacity: 0, y: 10 }}
+                        animate={{ opacity: 1, y: 0 }}
+                        className="bg-slate-800/50 rounded-lg overflow-hidden cursor-pointer hover:bg-slate-800 transition-colors"
+                        onClick={() => handleHistoryClick(generation)}
+                        role="button"
+                        tabIndex={0}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter") handleHistoryClick(generation);
+                        }}
+                      >
+                        <img
+                          src={generation.imageUrl}
+                          alt={generation.prompt}
+                          className="w-full h-32 object-cover"
+                        />
+                        <div className="p-3">
+                          <p className="text-xs text-slate-300 mb-1">
+                            {new Date(
+                              generation.createdAt
+                            ).toLocaleDateString()}
+                          </p>
+                          <p className="text-sm font-medium truncate mb-1">
+                            {generation.prompt}
+                          </p>
+                          <p className="text-xs text-slate-400">
+                            Style: {generation.style}
+                          </p>
+                        </div>
+                      </motion.div>
+                    ))
+                  )}
+                </div>
+              </div>
             </motion.div>
           )}
         </AnimatePresence>
-
-        {/* Toast */}
-        <div className="fixed right-4 bottom-6 z-50">
-          <AnimatePresence>
-            {toast && (
-              <motion.div
-                initial={{ opacity: 0, y: 10 }}
-                animate={{ opacity: 1, y: 0 }}
-                exit={{ opacity: 0, y: 10 }}
-                className={`min-w-[220px] px-4 py-3 rounded-lg shadow-lg ${
-                  toast.type === "error"
-                    ? "bg-red-600"
-                    : toast.type === "success"
-                    ? "bg-emerald-600"
-                    : "bg-gray-800"
-                }`}
-                role="status"
-              >
-                <div className="flex items-center gap-3">
-                  {toast.type === "error" ? (
-                    <AlertTriangle className="h-5 w-5" />
-                  ) : (
-                    <Sparkles className="h-5 w-5" />
-                  )}
-                  <div className="text-sm font-medium">{toast.text}</div>
-                </div>
-              </motion.div>
-            )}
-          </AnimatePresence>
-        </div>
       </div>
-    </ErrorBoundary>
+
+      {/* Full Screen Image Modal */}
+      <AnimatePresence>
+        {zoomImage && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/90"
+            onClick={() => setZoomImage(null)}
+          >
+            <motion.div
+              initial={{ scale: 0.9 }}
+              animate={{ scale: 1 }}
+              exit={{ scale: 0.9 }}
+              className="relative max-w-[90vw] max-h-[90vh]"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <button
+                onClick={() => setZoomImage(null)}
+                className="absolute top-4 right-4 z-10 p-2 bg-black/50 hover:bg-black/70 rounded-full transition-colors"
+                aria-label="Close full size image"
+              >
+                <X className="w-6 h-6" />
+              </button>
+              <img
+                src={zoomImage}
+                alt="Full size preview"
+                className="max-w-full max-h-full object-contain rounded-lg"
+              />
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* Toast Notifications */}
+      <AnimatePresence>
+        {toast && (
+          <motion.div
+            initial={{ opacity: 0, y: 50, scale: 0.9 }}
+            animate={{ opacity: 1, y: 0, scale: 1 }}
+            exit={{ opacity: 0, y: 50, scale: 0.9 }}
+            className="fixed bottom-6 right-6 z-40"
+          >
+            <div
+              className={`px-4 py-3 rounded-lg shadow-xl flex items-center gap-3 ${
+                toast.type === "error"
+                  ? "bg-red-600"
+                  : toast.type === "success"
+                  ? "bg-green-600"
+                  : "bg-blue-600"
+              }`}
+            >
+              {toast.type === "error" ? (
+                <AlertTriangle className="w-5 h-5" />
+              ) : (
+                <Sparkles className="w-5 h-5" />
+              )}
+              <span className="text-sm font-medium">{toast.text}</span>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+    </div>
   );
 }
